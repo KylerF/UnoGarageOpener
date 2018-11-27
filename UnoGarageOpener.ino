@@ -97,7 +97,7 @@ WiFiServer local_server(80);
 WiFiClient client;
 
 // Home automation API for logging to MySQL
-const char freas_server[] = API_IP;
+const char freas_server[] = SERVER_IP;
 const int homeautomation_port = API_PORT;
 WiFiClient api_client;
 HttpClient http_client = HttpClient(api_client, freas_server, homeautomation_port);
@@ -210,6 +210,7 @@ void proccess_command(char c) {
     current_line += c;
   }
 
+  // Check for a completed command
   if (current_line.endsWith("GET /trigger")) {
     trigger_door();
   } else if (current_line.endsWith("GET /refresh")) {
@@ -217,22 +218,21 @@ void proccess_command(char c) {
   }
 }
 
-// Calls the home automation API to log the door status.
-// Called each time the door status changes.
+// Sends a POST request to the home automation API to 
+// log the door status. Called each time the door status changes.
 void log_door_status() {
   Serial.println("making POST request");
-  String content_type = "application/json";
-  String post_data = "\"{'device':'arduino','doorStatus':'" + String(door_status_string()) + "','remoteTrigger':'" + (last_door_trigger > 0) + "'}\"";
 
-  //http_client.post(API_PATH, content_type, post_data);
-  http_client.beginRequest();
-  http_client.post(API_PATH);
-  http_client.sendHeader("Content-Type", content_type);
-  http_client.sendHeader("Content-Length", post_data.length());
-  http_client.sendHeader("Connection", "close");
-  http_client.beginBody();
-  http_client.print(post_data);
-  http_client.endRequest();
+  // Construct the JSON data
+  String content_type = "application/json";
+  String post_data = "\"{'device':'arduino','doorStatus':'" 
+        + String(door_status_string()) 
+        + "','remoteTrigger':'" 
+        + (last_door_trigger > 0) 
+   + "'}\"";
+
+  // Send the POST request
+  http_client.post(API_PATH, content_type, post_data);
 
   // Read the status code and body of the response
   Serial.print("Status code: ");
@@ -241,8 +241,6 @@ void log_door_status() {
   Serial.println(http_client.responseBody());
 
   http_client.stop();
-
-  Serial.println("HERE");
 }
 
 // ISR for reed switch interrupts
@@ -250,16 +248,14 @@ void log_door_status() {
 // rather than waiting for the timeout period to end.
 void switch_interrupt() {
   Serial.println("ISR");
-  // Update door status and log it
   door_status = get_door_status();
-  log_door_status();
-  
-  // Reset the trigger timer
-  last_door_trigger = 0;
 }
 
 // Refresh the current door status based on reed switch values
 int get_door_status() {
+  // Reset the trigger timer
+  last_door_trigger = 0;
+  
   // Read the switches
   int door_open   = digitalRead(switch_open_pin);
   int door_closed = digitalRead(switch_closed_pin);
