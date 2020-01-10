@@ -5,24 +5,20 @@
 // Visiting the host URL without any commands will display the status 
 // without any other action.
 //
-// Update 11/24/2018: Send request to home automation server API to 
-// log each time the garage is opened or closed, and whether it was
-// triggered remotely.
-//
 // Author: Kyler Freas
 // Last updated: 11/24/2018
 
 #include <SPI.h>
 #include <WiFi.h>
 #include "wifi-auth.h"
-#include <ArduinoHttpClient.h>
 #include <string.h>
 
 ////////////////////// Commands //////////////////////
 // Unique ID for each command
 enum command_id {
   refresh_command,
-  trigger_command,
+  open_command,
+  close_command,
   invalid_command
 };
 
@@ -36,8 +32,9 @@ struct command_table_entry {
 static struct command_table_entry command_table[] = 
 { 
   { "refresh", refresh_command },
-  { "trigger", trigger_command },
-  { NULL, invalid_command }
+  { "open",    open_command    },
+  { "close",   close_command   },
+  { NULL,      invalid_command }
 };
 //////////////////////////////////////////////////////
 
@@ -56,23 +53,23 @@ enum door_status_id {
 // Door status lookup table entry containing all status
 // details and transition instructions
 struct door_status_table_entry {
-  enum door_status_id id;      // status ID
-  int  open_switch_value;      // value of the door open switch in this state (0 or 1)
-  int  closed_switch_value;    // value of the door closed switch in this state (0 or 1)
-  enum door_status_id next_id; // ID of next status to go to after door is triggered
-  char * description;          // string description to return
+  enum door_status_id id;            // status ID
+  int  open_switch_value;            // value of the door open switch in this state (0 or 1)
+  int  closed_switch_value;          // value of the door closed switch in this state (0 or 1)
+  enum door_status_id next_id_open;  // ID of next status to go to after an open command is received
+  enum door_status_id next_id_close; // ID of next status to go to after a close command is received
+  char * description;                // string description to return
 };
 
 // Lookup table for door status
 static struct door_status_table_entry door_status_table[] = 
 { 
-  { open_status,      1, 0, closing_status,   "open"       },
-  { closed_status,    0, 1, opening_status,   "closed"     },
-  { error_status,     1, 1, error_status,     "reed_error" },
-  { stuck_status,     0, 0, stuck_status,     "stuck"      },
-  { opening_status,   0, 0, cancelled_status, "opening"    },
-  { cancelled_status, 0, 0, closing_status,   "cancelled"  },
-  { closing_status,   0, 0, opening_status,   "closing"    },
+  { open_status,    1, 0, open_status,    closing_status, "open"       },
+  { closed_status,  0, 1, opening_status, closed_status,  "closed"     },
+  { error_status,   1, 1, error_status,   error_status,   "reed_error" },
+  { stuck_status,   0, 0, stuck_status,   stuck_status,   "stuck"      },
+  { opening_status, 0, 0, opening_status, opening_status, "opening"    },
+  { closing_status, 0, 0, opening_status, closing_status,  "closing"    },
   { NULL }
 };
 
@@ -87,7 +84,8 @@ const int switch_open_pin  =  2;
 //////////////////////////////////////////////////////
 
 /////////////////////// WiFi /////////////////////////
-char ssid[] = SECRET_SSID;
+char * ssid_list[] = SSID_LIST;
+char * ssid = ssid_list[0];
 char pass[] = SECRET_PASS;
 
 int wifi_status = WL_IDLE_STATUS;
@@ -95,12 +93,6 @@ int wifi_status = WL_IDLE_STATUS;
 // Local web server to handle HTTP requests
 WiFiServer local_server(80);
 WiFiClient client;
-
-// Home automation API for logging to MySQL
-const char freas_server[] = SERVER_IP;
-const int homeautomation_port = API_PORT;
-WiFiClient api_client;
-HttpClient http_client = HttpClient(api_client, freas_server, homeautomation_port);
 //////////////////////////////////////////////////////
 
 // Timeout to wait for door to move (millis)
@@ -123,7 +115,6 @@ void setup() {
 
   connect_wifi();
   door_status = get_door_status();
-  //log_door_status();
 }
 
 // Wait for client connection and parse any incoming requests
@@ -158,12 +149,15 @@ void connect_wifi() {
     while(true);
   } 
 
+  static int retries = 0;
   while ( wifi_status != WL_CONNECTED) { 
+    ssid = ssid_list[retries % 2];
     Serial.print("Attempting to connect to SSID: ");
     Serial.println(ssid);  
     wifi_status = WiFi.begin(ssid, pass);
 
     delay(5000);
+    retries++;
   }
   
   local_server.begin();
@@ -191,6 +185,15 @@ void print_wifi_status() {
 // Process incoming characters and process door commands.
 void proccess_command(char c) {
   static String current_line = "";
+
+  // Check for a completed command
+  if (current_line.endsWith("GET /open")) {
+    trigger_door(open_command);
+  } else if (current_line.endsWith("GET /close")) {
+    trigger_door(close_command);
+  } else if (current_line.endsWith("GET /refresh")) {
+    door_status = get_door_status();
+  }
   
   if (c == '\n') {
     if (current_line.length() == 0) {
@@ -200,8 +203,9 @@ void proccess_command(char c) {
   
       // Complete command received. Return the door status.
       client.print(door_status_string());
-      client.println();
+      delay(100);
       client.stop();
+      
       current_line = "";
     } else {
       current_line = "";
@@ -209,38 +213,6 @@ void proccess_command(char c) {
   } else if (c != '\r') {
     current_line += c;
   }
-
-  // Check for a completed command
-  if (current_line.endsWith("GET /trigger")) {
-    trigger_door();
-  } else if (current_line.endsWith("GET /refresh")) {
-    door_status = get_door_status();
-  }
-}
-
-// Sends a POST request to the home automation API to 
-// log the door status. Called each time the door status changes.
-void log_door_status() {
-  Serial.println("making POST request");
-
-  // Construct the JSON data
-  String content_type = "application/json";
-  String post_data = "\"{'device':'arduino','doorStatus':'" 
-        + String(door_status_string()) 
-        + "','remoteTrigger':'" 
-        + (last_door_trigger > 0) 
-   + "'}\"";
-
-  // Send the POST request
-  http_client.post(API_PATH, content_type, post_data);
-
-  // Read the status code and body of the response
-  Serial.print("Status code: ");
-  Serial.println(http_client.responseStatusCode());
-  Serial.print("Response: ");
-  Serial.println(http_client.responseBody());
-
-  http_client.stop();
 }
 
 // ISR for reed switch interrupts
@@ -269,7 +241,6 @@ int get_door_status() {
   
   for ( ; p_entry->description != NULL ; p_entry++ )
     if ((door_open == p_entry->open_switch_value) && (door_closed == p_entry->closed_switch_value)) {
-      // Log the status to MySQL and return
       return p_entry->id;
     }
 }
@@ -284,25 +255,35 @@ char * door_status_string() {
 }
 
 // Retrieve the new door status after triggering the door
-int next_door_status() {
+int next_door_status(int command) {
   struct door_status_table_entry * p_entry = door_status_table ;
   
-  for ( ; p_entry->description != NULL ; p_entry++ )
-    if ( door_status == p_entry->id )
-      return p_entry->next_id;
+  for ( ; p_entry->description != NULL ; p_entry++ ) {
+    if ( door_status == p_entry->id ) {
+      if (command == open_command) {
+        return p_entry->next_id_open;
+      } else if (command == close_command) {
+        return p_entry->next_id_close;
+      }
+    }  
+  }
+    
+  return door_status;
 }
 
-// Triggers the door button and sets the new status manually
-void trigger_door() {
-  // Do nothing if the door is stuck or a reed switch is faulty
-  if (door_status == stuck_status || door_status == error_status) return;
+// Triggers the door button and sets the new status
+void trigger_door(int command) {
+  // Set the status check timer and new door status
+  last_door_trigger = millis();
+  int current_status = door_status;
+  door_status = next_door_status(command);
+  
+  // Do nothing if the status stays the same
+  if (current_status == door_status) return;
 
   // Trigger the door button
   digitalWrite(trigger_door_pin, HIGH);
   delay(1000);
   digitalWrite(trigger_door_pin, LOW);
-
-  // Set the status check timer and new door status
-  last_door_trigger = millis();
-  door_status = next_door_status();
 }
+
